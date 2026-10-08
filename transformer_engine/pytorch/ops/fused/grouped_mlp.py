@@ -20,7 +20,8 @@ from ...constants import MXFP8_BLOCK_SCALING_SIZE, NVFP4_BLOCK_SCALING_SIZE
 from ...cpu_offload import is_cpu_offload_enabled, mark_activation_offload, start_offload
 from ...cpp_extensions import general_gemm, general_grouped_gemm_for_grouped_tensor
 from ...module.base import _2X_ACC_WGRAD
-from ...quantization import Recipe
+from ...mxfp4_qat import mxfp4_fake_quantize
+from ...quantization import FP8GlobalStateManager, Recipe
 from ...tensor import NVFP4Quantizer, NVFP4Tensor, NVFP4TensorStorage, Quantizer
 from ...tensor.grouped_tensor import GroupedTensor
 from ...tensor.mxfp8_tensor import MXFP8Quantizer
@@ -905,6 +906,25 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
         fc2_input_quantizer = fc2_op.get_quantizer("forward", 0)
         fc2_weight_quantizer = fc2_op.get_quantizer("forward", 1)
         fc2_grad_output_quantizer = fc2_op.get_quantizer("backward", 0)
+        fp8_recipe = (
+            FP8GlobalStateManager.get_fp8_recipe()
+            if FP8GlobalStateManager.is_fp8_enabled()
+            else None
+        )
+        mxfp4_qat = fp8_recipe is not None and fp8_recipe.mxfp4_qat()
+        if fp8_recipe is not None and fp8_recipe.backward_override is not None and requires_grad:
+            # The fused backward replays the quantized weights, so an override would be
+            # silently ignored. ``requires_grad`` is the fuser's signal; grad mode is off here.
+            raise NotImplementedError(
+                "Pure and MXFP4-QAT fused grouped-MLP ops support only "
+                f"backward_override=None, got {fp8_recipe.backward_override!r}."
+            )
+        if mxfp4_qat:
+            if dtype == torch.float16:
+                raise NotImplementedError(
+                    "MXFP4 QAT does not support fp16 as the activation/dequantize dtype: "
+                    "use bf16 or fp32."
+                )
 
         # Extract split sizes from extra input
         fc1_split_sizes = basic_op_extra_inputs[0][0]
@@ -949,6 +969,11 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                     "FC1 expected GroupedTensor weight with single_grouped_weight=True."
                 )
             if fc1_op.weight.quantizer is not None:
+                if mxfp4_qat:
+                    raise NotImplementedError(
+                        "MXFP4 QAT fused grouped-MLP ops require high-precision "
+                        "master weights, not primary quantized weights."
+                    )
                 fc1_weight_quantizer.set_usage(rowwise=True, columnwise=input_requires_grad)
                 fc1_op.weight.quantizer = fc1_weight_quantizer
                 grouped_fc1_weight = fc1_op.weight
@@ -956,8 +981,13 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                 if fc1_op.weight.rowwise_data is None:
                     raise RuntimeError("FC1 grouped weight has no rowwise_data to quantize.")
                 fc1_weight_quantizer.set_usage(rowwise=True, columnwise=input_requires_grad)
+                fc1_weight_data = fc1_op.weight.rowwise_data.view(fc1_op.weight.logical_shape)
+                if mxfp4_qat:
+                    # Packed == per-expert: rows never straddle experts, 1x32 blocks
+                    # span the inner dim.
+                    fc1_weight_data = mxfp4_fake_quantize(fc1_weight_data)
                 grouped_fc1_weight = _group_quantize_for_grouped_mlp(
-                    fc1_op.weight.rowwise_data.view(fc1_op.weight.logical_shape),
+                    fc1_weight_data,
                     fc1_weight_quantizer,
                     num_groups,
                     None,
@@ -969,8 +999,14 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                 quantizer = fc1_op.get_quantizer("forward", 2 * idx + 1)
                 if not is_quantized_tensor(weight):
                     quantizer.set_usage(rowwise=True, columnwise=input_requires_grad)
-                    quantized_fc1_weights.append(quantizer(weight))
+                    weight_for_quantize = mxfp4_fake_quantize(weight) if mxfp4_qat else weight
+                    quantized_fc1_weights.append(quantizer(weight_for_quantize))
                 else:
+                    if mxfp4_qat:
+                        raise NotImplementedError(
+                            "MXFP4 QAT fused grouped-MLP ops require high-precision "
+                            "master weights, not primary quantized weights."
+                        )
                     quantized_fc1_weights.append(weight)
             grouped_fc1_weight = quantized_fc1_weights
 
@@ -981,6 +1017,11 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                     "FC2 expected GroupedTensor weight with single_grouped_weight=True."
                 )
             if fc2_op.weight.quantizer is not None:
+                if mxfp4_qat:
+                    raise NotImplementedError(
+                        "MXFP4 QAT fused grouped-MLP ops require high-precision "
+                        "master weights, not primary quantized weights."
+                    )
                 fc2_weight_quantizer.set_usage(rowwise=True, columnwise=input_requires_grad)
                 fc2_op.weight.quantizer = fc2_weight_quantizer
                 grouped_fc2_weight = fc2_op.weight
@@ -988,8 +1029,12 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                 if fc2_op.weight.rowwise_data is None:
                     raise RuntimeError("FC2 grouped weight has no rowwise_data to quantize.")
                 fc2_weight_quantizer.set_usage(rowwise=True, columnwise=input_requires_grad)
+                fc2_weight_data = fc2_op.weight.rowwise_data.view(fc2_op.weight.logical_shape)
+                if mxfp4_qat:
+                    # See the FC1 packed-projection note.
+                    fc2_weight_data = mxfp4_fake_quantize(fc2_weight_data)
                 grouped_fc2_weight = _group_quantize_for_grouped_mlp(
-                    fc2_op.weight.rowwise_data.view(fc2_op.weight.logical_shape),
+                    fc2_weight_data,
                     fc2_weight_quantizer,
                     num_groups,
                     None,
@@ -1001,8 +1046,14 @@ class _GroupedMLP_CuTeGEMMBase(FusedOperation):
                 quantizer = fc2_op.get_quantizer("forward", 2 * idx + 1)
                 if not is_quantized_tensor(weight):
                     quantizer.set_usage(rowwise=True, columnwise=input_requires_grad)
-                    quantized_fc2_weights.append(quantizer(weight))
+                    weight_for_quantize = mxfp4_fake_quantize(weight) if mxfp4_qat else weight
+                    quantized_fc2_weights.append(quantizer(weight_for_quantize))
                 else:
+                    if mxfp4_qat:
+                        raise NotImplementedError(
+                            "MXFP4 QAT fused grouped-MLP ops require high-precision "
+                            "master weights, not primary quantized weights."
+                        )
                     quantized_fc2_weights.append(weight)
             grouped_fc2_weight = quantized_fc2_weights
 

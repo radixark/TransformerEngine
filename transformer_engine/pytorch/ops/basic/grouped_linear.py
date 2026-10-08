@@ -23,6 +23,7 @@ from ...module.base import (
     _2X_ACC_DGRAD,
     _2X_ACC_WGRAD,
 )
+from ...mxfp4_qat import mxfp4_fake_quantize
 from ...cpu_offload import is_cpu_offload_enabled, mark_activation_offload, start_offload
 from ...quantization import FP8GlobalStateManager, QuantizerRole, Recipe
 from ...quantized_tensor import QuantizedTensorStorage
@@ -464,12 +465,63 @@ class GroupedLinear(BasicOperation):
         for group_idx in range(self.num_groups):
             self.register_parameter(f"bias{group_idx}", None)
 
+    @staticmethod
+    def _mxfp4_qat_recipe() -> Optional[Recipe]:
+        """Return the active MXFP4-QAT recipe, if any."""
+        if (
+            FP8GlobalStateManager.is_fp8_enabled() or FP8GlobalStateManager.with_fp8_parameters()
+        ) and FP8GlobalStateManager.get_fp8_recipe().mxfp4_qat():
+            return FP8GlobalStateManager.get_fp8_recipe()
+        return None
+
+    @staticmethod
+    def _reject_backward_override(context: str, *, requires_backward: bool) -> None:
+        """Reject backward-override recipes that this op cannot honor.
+
+        Both backends replay the quantized weights in the backward dgrad GEMM, so the
+        override would be silently ignored. ``requires_backward`` comes from the fuser,
+        since ``torch.is_grad_enabled()`` is always False in fuser_forward.
+        """
+        if not requires_backward:
+            return
+        if not FP8GlobalStateManager.is_fp8_enabled():
+            return
+        backward_override = FP8GlobalStateManager.get_fp8_recipe().backward_override
+        if backward_override is not None:
+            raise NotImplementedError(
+                "ops.GroupedLinear only supports backward_override=None, got "
+                f"{backward_override!r} ({context}): the grouped backward "
+                "replays the quantized weights and would silently ignore the "
+                "override."
+            )
+
+    @classmethod
+    def _validate_mxfp4_qat_discrete_weights(cls, weights: Sequence[torch.Tensor]) -> bool:
+        """Validate the supported QAT subset and report whether projection is needed."""
+        qat_recipe = cls._mxfp4_qat_recipe()
+        if qat_recipe is None:
+            return False
+        if any(is_quantized_tensor(weight) for weight in weights):
+            raise NotImplementedError(
+                "MXFP4 QAT recipes do not support quantized primary weights in the "
+                "operations API: the high-precision master is required for the QAT "
+                "projection."
+            )
+        return True
+
     def _quantize_weights(
         self,
         weights: Sequence[torch.Tensor],
         quantizers: Sequence[Quantizer],
     ) -> Sequence[torch.Tensor]:
         """Construct quantized weight tensors."""
+
+        if self._mxfp4_qat_recipe() is not None:
+            raise NotImplementedError(
+                "MXFP4 QAT recipes do not support quantized primary weights in the "
+                "operations API: the high-precision master is required for the QAT "
+                "projection."
+            )
 
         # Manually construct MXFP8 weights
         if isinstance(quantizers[0], MXFP8Quantizer):
@@ -765,7 +817,7 @@ class GroupedLinear(BasicOperation):
         * The graph-safe path dispatches to ``general_grouped_gemm_for_grouped_tensor``,
           which is backed by ``nvte_grouped_gemm_with_discrete_inputA`` in the common
           library. This filter mirrors cuBLASLt grouped GEMM's architecture
-          requirement without duplicating its cuBLAS version checks.
+          requirement and minimum cuBLAS version for setup.
         * Quantized compute supports MXFP8 and NVFP4 on Blackwell GPUs with Compute Capability (CC)
           10.x and 11.0. NVFP4 requires RHT because graph-safe grouped quantization currently
           requires RHT;
@@ -778,6 +830,10 @@ class GroupedLinear(BasicOperation):
           would trigger a fatal error in the cuBLASLt grouped GEMM check.
         """
         if not (9, 0) <= get_device_compute_capability() <= (11, 0):
+            return False
+        # Every graph-safe flow runs the grouped-GEMM setup workspace query, which
+        # requires cuBLAS 13.3+; fall back to the split-quantize flow on older cuBLAS.
+        if tex.get_cublasLt_version() < 130300:
             return False
         if with_quantized_compute:
             if not (10, 0) <= get_device_compute_capability() <= (11, 0):
@@ -794,10 +850,29 @@ class GroupedLinear(BasicOperation):
         columnwise_usage: bool,
         with_quantized_compute: bool,
         dtype: torch.dtype,
+        requires_backward: bool,
     ) -> GroupedTensorStorage:
         """Prepare weights for ``general_grouped_gemm_for_grouped_tensor``.
         Supports MXFP8/BF16/FP16 compute paths.
         """
+        mxfp4_qat = False
+        if with_quantized_compute:
+            self._reject_backward_override(
+                "single_grouped_weight path", requires_backward=requires_backward
+            )
+            mxfp4_qat = self._mxfp4_qat_recipe() is not None
+        if mxfp4_qat:
+            if weight_param.quantizer is not None:
+                raise NotImplementedError(
+                    "MXFP4 QAT recipes do not support quantized primary weights in the "
+                    "operations API: the high-precision master is required for the QAT "
+                    "projection."
+                )
+            if dtype == torch.float16:
+                raise NotImplementedError(
+                    "MXFP4 QAT does not support fp16 as the activation/dequantize dtype: "
+                    "use bf16 or fp32."
+                )
         num_groups = self.num_groups
         is_weight_quantized = weight_param.quantizer is not None
         if is_weight_quantized and with_quantized_compute:
@@ -836,8 +911,12 @@ class GroupedLinear(BasicOperation):
         # Quantized compute path, use the fused group quantize kernel.
         weight_quantizer = weight_quantizers[0]
         weight_quantizer.set_usage(rowwise=True, columnwise=columnwise_usage)
+        weight_data = weight_param.rowwise_data.view(weight_param.logical_shape)
+        if mxfp4_qat:
+            # Packed == per-expert: rows never straddle experts, 1x32 blocks span the inner dim.
+            weight_data = mxfp4_fake_quantize(weight_data)
         return tex.group_quantize(
-            weight_param.rowwise_data.view(weight_param.logical_shape),
+            weight_data,
             weight_quantizer,
             num_groups,
             None,
@@ -850,16 +929,31 @@ class GroupedLinear(BasicOperation):
         columnwise_usage: bool,
         with_quantized_compute: bool,
         dtype: torch.dtype,
+        requires_backward: bool,
     ) -> list[torch.Tensor]:
         """Prepare weights for ``general_grouped_gemm_for_grouped_tensor``.
         Returns a Python list, which dispatches the GEMM to ``discrete_in`` mode.
         """
+        with_mxfp4_qat = False
+        if with_quantized_compute:
+            self._reject_backward_override(
+                "discrete-weight path", requires_backward=requires_backward
+            )
+            with_mxfp4_qat = self._validate_mxfp4_qat_discrete_weights(weight_params)
+        if with_mxfp4_qat and dtype == torch.float16:
+            raise NotImplementedError(
+                "MXFP4 QAT does not support fp16 as the activation/dequantize dtype: "
+                "use bf16 or fp32."
+            )
         out: list[torch.Tensor] = []
         for w, quantizer in zip(weight_params, weight_quantizers):
             if not with_quantized_compute:
                 w = maybe_dequantize(w, dtype)
             elif with_quantized_compute and not is_quantized_tensor(w):
                 quantizer.set_usage(rowwise=True, columnwise=columnwise_usage)
+                if with_mxfp4_qat:
+                    # Identity STE: the manually computed wgrad lands on the original param.
+                    w = mxfp4_fake_quantize(w)
                 w = quantizer(w)
             out.append(w)
         return out
@@ -1129,6 +1223,7 @@ class GroupedLinear(BasicOperation):
             columnwise_usage=input_requires_grad,
             with_quantized_compute=with_quantized_compute,
             dtype=dtype,
+            requires_backward=input_requires_grad or weight_requires_grad,
         )
 
         # Split input tensor and convert dtypes if needed
@@ -1261,6 +1356,7 @@ class GroupedLinear(BasicOperation):
                 columnwise_usage=input_requires_grad,
                 with_quantized_compute=with_quantized_compute,
                 dtype=dtype,
+                requires_backward=input_requires_grad or weight_requires_grad,
             )
         else:
             # Discrete weights
@@ -1270,6 +1366,7 @@ class GroupedLinear(BasicOperation):
                 columnwise_usage=input_requires_grad,
                 with_quantized_compute=with_quantized_compute,
                 dtype=dtype,
+                requires_backward=input_requires_grad or weight_requires_grad,
             )
 
         # Allocate output buffer and wrap as a GroupedTensor view.
