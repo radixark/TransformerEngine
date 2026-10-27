@@ -25,6 +25,7 @@ from transformer_engine.pytorch import (
 )
 from transformer_engine.pytorch.attention.dot_product_attention import (
     _attention_backends,
+    backends as dpa_backends,
 )
 from transformer_engine.pytorch.attention.dot_product_attention.utils import (
     FlashAttentionUtils,
@@ -473,6 +474,122 @@ model_configs_fa4_mask = {
 def test_dpa_fa4_mask(dtype, model_configs, model):
     """Test DotProductAttention with FA4: various attention mask types"""
     test_dot_product_attention(dtype, model_configs, model, False, True, None, False, False)
+
+
+def _fa4_normalized_kwargs(kwargs):
+    received = {}
+    dpa_backends._fa4_with_none_window_sentinel(received.update)(**kwargs)
+    return received
+
+
+@pytest.mark.parametrize(
+    "sent,expected",
+    [
+        ({"window_size": (-1, 0)}, {"window_size": (None, 0)}),
+        ({"window_size": (511, -1)}, {"window_size": (511, None)}),
+        # Other negative offsets are not the -1 sentinel.
+        ({"window_size": (7, -8)}, {"window_size": (7, -8)}),
+        (
+            {"window_size_left": -1, "window_size_right": 0},
+            {"window_size_left": None, "window_size_right": 0},
+        ),
+        (
+            {"window_size_left": 0, "window_size_right": -1},
+            {"window_size_left": 0, "window_size_right": None},
+        ),
+        (
+            {"window_size_left": 7, "window_size_right": -8},
+            {"window_size_left": 7, "window_size_right": -8},
+        ),
+    ],
+)
+def test_fa4_window_sentinel_normalization(sent, expected):
+    """Convert only TE's -1 sentinel for both FA4 window argument forms."""
+    assert _fa4_normalized_kwargs(sent) == expected
+
+
+def _causal_thd_attention_reference(q, k, v, seqlens):
+    """Causal attention over each packed sequence of thd tensors, computed in float64"""
+    outputs = []
+    for q_seq, k_seq, v_seq in zip(*(t.split(seqlens) for t in (q, k, v))):
+        q_seq, k_seq, v_seq = (t.double().transpose(0, 1) for t in (q_seq, k_seq, v_seq))
+        num_groups = q_seq.shape[0] // k_seq.shape[0]
+        k_seq, v_seq = (t.repeat_interleave(num_groups, dim=0) for t in (k_seq, v_seq))
+        scores = q_seq @ k_seq.transpose(-2, -1) * q_seq.shape[-1] ** -0.5
+        future = torch.ones(scores.shape[-2:], dtype=torch.bool, device=q.device).triu(1)
+        probs = scores.masked_fill(future, float("-inf")).softmax(dim=-1)
+        outputs.append((probs @ v_seq).transpose(0, 1))
+    return torch.cat(outputs)
+
+
+# TE hands FA4 the causal window (-1, 0). Since flash-attn-4 4.0.0b30
+# (Dao-AILab/flash-attention#2490), FA4 reads that as a local window with left bound -1 unless
+# the unbounded side arrives as None, and returns zeros. The FA4 version that L3 CI installs
+# predates that change, and the tests above only compare backends with each other, so check FA4
+# against a reference directly.
+@pytest.mark.skipif(
+    not FlashAttentionUtils.v4_is_installed, reason="Flash-attn v4 (flash-attn-4) is required."
+)
+@pytest.mark.skipif(
+    device_compute_capability not in ((10, 0), (10, 3)),
+    reason="FA4 head_dim=256 dedicated kernel is SM100/103-only.",
+)
+@pytest.mark.parametrize("head_dim", [128, 256])
+def test_dpa_fa4_causal_thd_reference(monkeypatch, head_dim):
+    """Test DotProductAttention with FA4: padding_causal thd against a float64 reference"""
+    num_heads, num_gqa_groups = 8, 2
+    seqlens = [1, 37, 128, 300]
+    tols = dict(atol=1.5e-2, rtol=1.5e-2)
+
+    monkeypatch.setenv("NVTE_FLASH_ATTN", "1")
+    monkeypatch.setenv("NVTE_FUSED_ATTN", "0")
+    monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
+    _attention_backends["backend_selection_requires_update"] = True
+    fa4_windows = []
+    flash_attn_varlen_func_v4 = dpa_backends.flash_attn_varlen_func_v4
+
+    def record_fa4_window(*args, **kwargs):
+        fa4_windows.append(kwargs["window_size"])
+        return flash_attn_varlen_func_v4(*args, **kwargs)
+
+    monkeypatch.setattr(dpa_backends, "flash_attn_varlen_func_v4", record_fa4_window)
+
+    reset_rng_states()
+    num_tokens = sum(seqlens)
+    q = torch.randn(num_tokens, num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    k, v = (
+        torch.randn(num_tokens, num_gqa_groups, head_dim, dtype=torch.bfloat16, device="cuda")
+        for _ in range(2)
+    )
+    cu_seqlens = torch.tensor([0] + seqlens, device="cuda").cumsum(0).to(torch.int32)
+    inputs = [t.requires_grad_() for t in (q, k, v)]
+    ref_inputs = [t.detach().double().requires_grad_() for t in (q, k, v)]
+
+    dpa = DotProductAttention(
+        num_heads,
+        head_dim,
+        num_gqa_groups=num_gqa_groups,
+        qkv_format="thd",
+        attn_mask_type="padding_causal",
+    )
+    out = dpa(
+        *inputs,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        max_seqlen_q=max(seqlens),
+        max_seqlen_kv=max(seqlens),
+    ).reshape(num_tokens, num_heads, head_dim)
+    assert len(fa4_windows) == 1, f"Expected one FA4 call, got windows {fa4_windows}"
+    ref = _causal_thd_attention_reference(*ref_inputs, seqlens)
+    torch.testing.assert_close(out.double(), ref, **tols)
+
+    d_out = torch.randn_like(out)
+    out.backward(d_out)
+    ref.backward(d_out.double())
+    for name, t, ref_t in zip(("dq", "dk", "dv"), inputs, ref_inputs):
+        torch.testing.assert_close(
+            t.grad.double(), ref_t.grad, **tols, msg=lambda m, n=name: f"{n}: {m}"
+        )
 
 
 model_configs_softmax = {
