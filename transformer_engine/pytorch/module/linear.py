@@ -17,6 +17,7 @@ import transformer_engine_torch as tex
 from transformer_engine.common.recipe import Recipe
 from transformer_engine.pytorch.torch_version import torch_version
 
+from ..mxfp4_qat import mxfp4_fake_quantize
 from .base import (
     fill_userbuffers_buffer_for_all_gather,
     get_dummy_wgrad,
@@ -186,6 +187,9 @@ class LinearBwdArgs:
     fp8_recipe: Optional[Recipe] = None
     backward_override: Optional[str] = None
     is_weight_param_quantized: bool = False
+    # Forward projected the weight onto the MXFP4 grid before quantizing; backward must
+    # replay that, and can't infer it (``fp8`` may be forced False, and the autocast has exited).
+    mxfp4_qat: bool = False
     custom: bool = False
     debug: bool = False
 
@@ -660,6 +664,7 @@ def _linear_setup_ctx(
     bwd_args.fp8 = fp8
     bwd_args.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe() if fp8 else None
     bwd_args.backward_override = backward_override
+    bwd_args.mxfp4_qat = fp8 and FP8GlobalStateManager.get_fp8_recipe().mxfp4_qat()
     bwd_args.is_weight_param_quantized = isinstance(weight, QuantizedTensorStorage)
     bwd_args.custom = fwd_args.custom
     bwd_args.debug = fwd_args.debug
@@ -946,8 +951,13 @@ def _linear_backward(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None], ..
                     # fsdp2 quantized-tensor hooks when workspace was not saved.
                     weight_fp8 = saved_weight
                 elif bwd_args.weight_quantizer is not None:
+                    # Replay the forward's projection + quantization. Keyed on the recipe captured
+                    # in the forward; ``saved_weight`` must stay un-projected for high_precision.
+                    w_for_encode = saved_weight
+                    if bwd_args.mxfp4_qat:
+                        w_for_encode = mxfp4_fake_quantize(w_for_encode)
                     bwd_args.weight_quantizer.set_usage(rowwise=True, columnwise=True)
-                    weight_fp8 = bwd_args.weight_quantizer(saved_weight)
+                    weight_fp8 = bwd_args.weight_quantizer(w_for_encode)
 
             # Make sure required data is available
             if isinstance(grad_output, QuantizedTensorStorage):

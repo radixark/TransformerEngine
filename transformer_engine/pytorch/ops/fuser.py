@@ -18,6 +18,7 @@ from .op import (
     FusibleOperation,
     FusedOperation,
     OperationContext,
+    _recipe_fusion_signature,
 )
 
 
@@ -349,9 +350,9 @@ class OperationFuser:
         self._backward_ops: list[tuple[FusibleOperation, list[int]]]
 
         # Cache and detect change of state relevant for fusing operations
-        self.recipe_type = None
         self.first_op_requiring_backward = 0
-        self.backward_override = None
+        # An empty snapshot distinguishes first use from the unquantized recipe (None).
+        self._recipe_signature = ()
         self._last_amax_history_len = 0
 
         # Flatten list of parameters
@@ -438,15 +439,16 @@ class OperationFuser:
 
         # Early exit if fusion parameters haven't changed
         need_reset = False
-        recipe_type = type(recipe)
-        backward_override = recipe.backward_override if recipe is not None else None
-        fusion_params = (recipe_type, first_op_requiring_backward, backward_override)
+        recipe_signature = _recipe_fusion_signature(recipe)
+        fusion_params = (
+            first_op_requiring_backward,
+            recipe_signature,
+        )
         if fusion_params != (
-            self.recipe_type,
             self.first_op_requiring_backward,
-            self.backward_override,
+            self._recipe_signature,
         ):
-            # Recipe type, backward override, or grad requirements have changed
+            # Recipe type/config, backward override, or grad requirements have changed.
             need_reset = True
         elif (
             recipe is not None
@@ -463,7 +465,7 @@ class OperationFuser:
             op.reset_recipe_state(recipe=recipe)
 
         # Check if this is the first iteration
-        if self.recipe_type is None:
+        if self._recipe_signature == ():
             for op in self._basic_ops:
                 op.pre_first_fuser_forward()
 
@@ -493,7 +495,10 @@ class OperationFuser:
         )
 
         # Save current fusion params
-        self.recipe_type, self.first_op_requiring_backward, self.backward_override = fusion_params
+        (
+            self.first_op_requiring_backward,
+            self._recipe_signature,
+        ) = fusion_params
 
         # Save amax history length
         if isinstance(recipe, DelayedScaling):
