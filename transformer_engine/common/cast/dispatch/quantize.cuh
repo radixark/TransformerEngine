@@ -50,8 +50,9 @@ void quantize_fwd_helper(const NVTETensor input, NVTETensor output,
 
   // Check for unsupported options
   if (quant_config_cpp.stochastic_rounding) {
-    NVTE_CHECK(output_tensor->scaling_mode == NVTE_NVFP4_1D_SCALING,
-               "Stochastic rounding is only supported for NVFP4 quantization.");
+    NVTE_CHECK(output_tensor->scaling_mode == NVTE_NVFP4_1D_SCALING ||
+                   output_tensor->scaling_mode == NVTE_MXFP8_1D_SCALING,
+               "Stochastic rounding is only supported for NVFP4 and MXFP8 quantization.");
   }
 
   NVTE_CHECK(output_tensor->has_data() || output_tensor->has_columnwise_data(),
@@ -86,7 +87,7 @@ void quantize_fwd_helper(const NVTETensor input, NVTETensor output,
       Tensor *dummy_workspace_tensor = nullptr;
       mxfp8::quantize</*IS_DBIAS=*/false, /*IS_DACT=*/false, IS_ACT, ParamOP, OP>(
           *input_tensor, dummy_input_tensor, noop_tensor, output_tensor, dummy_dbias_tensor,
-          dummy_workspace_tensor, stream);
+          dummy_workspace_tensor, quant_config_cpp, stream);
       break;
     }
     case NVTE_NVFP4_1D_SCALING: {
@@ -222,8 +223,9 @@ void quantize_bwd_helper(const NVTETensor grad, const NVTETensor input, NVTETens
 
   // Check for unsupported options
   if (quant_config_cpp.stochastic_rounding) {
-    NVTE_CHECK(output_tensor->scaling_mode == NVTE_NVFP4_1D_SCALING,
-               "Stochastic rounding is only supported for NVFP4 quantization.");
+    NVTE_CHECK(output_tensor->scaling_mode == NVTE_NVFP4_1D_SCALING ||
+                   output_tensor->scaling_mode == NVTE_MXFP8_1D_SCALING,
+               "Stochastic rounding is only supported for NVFP4 and MXFP8 quantization.");
   }
 
   NVTE_CHECK(output_tensor->has_data() || output_tensor->has_columnwise_data(),
@@ -251,7 +253,7 @@ void quantize_bwd_helper(const NVTETensor grad, const NVTETensor input, NVTETens
     case NVTE_MXFP8_1D_SCALING: {
       mxfp8::quantize<IS_DBIAS, IS_DACT, /*IS_ACT=*/false, ParamOP, OP>(
           *grad_tensor, input_tensor, noop_tensor, output_tensor, dbias_tensor, workspace_tensor,
-          stream);
+          quant_config_cpp, stream);
       break;
     }
     case NVTE_NVFP4_1D_SCALING: {

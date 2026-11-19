@@ -105,7 +105,8 @@ std::vector<py::object> layernorm_fwd(py::handle input, py::handle weight, Maybe
   Impl impl = Impl::UNFUSED;
   if (quantizer.is_none() || IsFloat8Quantizers(quantizer.ptr())) {
     impl = Impl::FULLY_FUSED;
-  } else if (IsMXFP8Quantizers(quantizer.ptr())) {
+  } else if (IsMXFP8Quantizers(quantizer.ptr()) &&
+             !IsMXFP8StochasticRoundingQuantizer(quantizer.ptr())) {
     if (transformer_engine::getenv<bool>("NVTE_NORM_FWD_USE_CUDNN") && outer_size % 128 == 0 &&
         inner_size % 128 == 0) {
       // cuDNN MXFP8 kernel requires full 128x128 tiles
@@ -342,7 +343,8 @@ std::vector<py::object> rmsnorm_fwd(const py::handle &input, const py::handle &w
   Impl impl = Impl::UNFUSED;
   if (quantizer.is_none() || IsFloat8Quantizers(quantizer.ptr())) {
     impl = Impl::FULLY_FUSED;
-  } else if (IsMXFP8Quantizers(quantizer.ptr())) {
+  } else if (IsMXFP8Quantizers(quantizer.ptr()) &&
+             !IsMXFP8StochasticRoundingQuantizer(quantizer.ptr())) {
     if (transformer_engine::getenv<bool>("NVTE_NORM_FWD_USE_CUDNN") && outer_size % 128 == 0 &&
         inner_size % 128 == 0) {
       // cuDNN MXFP8 kernel requires full 128x128 tiles

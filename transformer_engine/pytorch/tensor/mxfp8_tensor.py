@@ -33,6 +33,8 @@ class MXFP8Quantizer(Quantizer):
     """
 
     dtype: DType
+    """Round each element stochastically between its two neighbouring FP8 values"""
+    stochastic_rounding: bool
 
     def __init__(
         self,
@@ -40,9 +42,11 @@ class MXFP8Quantizer(Quantizer):
         *,
         rowwise: bool = True,
         columnwise: bool = True,
+        stochastic_rounding: bool = False,
     ) -> None:
         super().__init__(rowwise=rowwise, columnwise=columnwise)
         self.dtype = DType.cast(fp8_dtype)
+        self.stochastic_rounding = stochastic_rounding
 
     def copy(self) -> MXFP8Quantizer:
         """Create shallow copy"""
@@ -51,6 +55,7 @@ class MXFP8Quantizer(Quantizer):
             fp8_dtype=self.dtype,
             rowwise=self.rowwise_usage,
             columnwise=self.columnwise_usage,
+            stochastic_rounding=self.stochastic_rounding,
         )
         quantizer.internal = self.internal
         quantizer.optimize_for_gemm = self.optimize_for_gemm

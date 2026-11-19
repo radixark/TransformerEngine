@@ -62,6 +62,12 @@ inline bool IsFloat8Tensor(PyObject *obj) {
 
 inline bool IsMXFP8Quantizers(PyObject *obj) { return Py_TYPE(obj) == MXFP8QuantizerClass; }
 
+// Fused kernels that emit MXFP8 round to nearest; only MXFP8Quantizer::quantize rounds stochastically.
+inline bool IsMXFP8StochasticRoundingQuantizer(PyObject *obj) {
+  return IsMXFP8Quantizers(obj) &&
+         pybind11::handle(obj).attr("stochastic_rounding").cast<bool>();
+}
+
 inline bool IsMXFP8Tensor(PyObject *obj) {
   return Py_TYPE(obj) == MXFP8TensorPythonClass || Py_TYPE(obj) == MXFP8TensorStoragePythonClass;
 }

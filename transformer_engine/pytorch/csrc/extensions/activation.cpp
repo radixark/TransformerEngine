@@ -35,7 +35,8 @@ py::object activation_helper(const at::Tensor& input, py::handle quantizer, int 
   enum class Impl { UNFUSED, FULLY_FUSED, FUSED_ACTIVATION_AMAX_FP8, FUSED_ACTIVATION_AMAX_NVFP4 };
   Impl impl = Impl::UNFUSED;
   if (quantizer.is_none() || detail::IsFloat8Quantizers(quantizer.ptr()) ||
-      detail::IsMXFP8Quantizers(quantizer.ptr())) {
+      (detail::IsMXFP8Quantizers(quantizer.ptr()) &&
+       !detail::IsMXFP8StochasticRoundingQuantizer(quantizer.ptr()))) {
     impl = Impl::FULLY_FUSED;
   } else if (detail::IsFloat8CurrentScalingQuantizers(quantizer.ptr())) {
     impl = Impl::FUSED_ACTIVATION_AMAX_FP8;
@@ -148,7 +149,8 @@ py::object dactivation_helper(const at::Tensor& grad_output, const at::Tensor& i
   enum class Impl { UNFUSED, FULLY_FUSED, FUSED_ACTIVATION_AMAX_FP8, FUSED_ACTIVATION_AMAX_NVFP4 };
   Impl impl = Impl::UNFUSED;
   if (quantizer.is_none() || detail::IsFloat8Quantizers(quantizer.ptr()) ||
-      detail::IsMXFP8Quantizers(quantizer.ptr())) {
+      (detail::IsMXFP8Quantizers(quantizer.ptr()) &&
+       !detail::IsMXFP8StochasticRoundingQuantizer(quantizer.ptr()))) {
     impl = Impl::FULLY_FUSED;
   } else if (detail::IsFloat8CurrentScalingQuantizers(quantizer.ptr())) {
     impl = Impl::FUSED_ACTIVATION_AMAX_FP8;
