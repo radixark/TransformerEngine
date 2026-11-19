@@ -1376,6 +1376,7 @@ std::vector<size_t> Float8BlockQuantizer::get_scale_shape(const std::vector<size
 
 MXFP8Quantizer::MXFP8Quantizer(const py::handle& quantizer) : Quantizer(quantizer) {
   this->dtype = quantizer.attr("dtype").cast<DType>();
+  this->stochastic_rounding = quantizer.attr("stochastic_rounding").cast<bool>();
 }
 
 void MXFP8Quantizer::set_quantization_params(TensorWrapper* tensor) const {}
@@ -1701,6 +1702,20 @@ void MXFP8Quantizer::quantize(const TensorWrapper& input, TensorWrapper& out,
   QuantizationConfigWrapper quant_config;
   if (noop_flag) {
     quant_config.set_noop_tensor(noop_flag->data());
+  }
+  quant_config.set_stochastic_rounding(this->stochastic_rounding);
+  TensorWrapper te_rng_state;
+  if (this->stochastic_rounding) {
+    // A generic MXFP8 kernel thread draws at most 64 32-bit values (one per 4 elements), so
+    // successive casts never reuse a Philox offset range.
+    const size_t rng_elts_per_thread = 128;
+    auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+        std::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
+    at::PhiloxCudaState philox_args = init_philox_state(gen, rng_elts_per_thread);
+    auto rng_state = torch::empty({2}, at::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
+    philox_unpack(philox_args, static_cast<int64_t*>(rng_state.data_ptr()));
+    te_rng_state = makeTransformerEngineTensor(rng_state);
+    quant_config.set_rng_state(te_rng_state.data());
   }
   NVTE_SCOPED_GIL_RELEASE({
     nvte_quantize_v2(input.data(), out.data(), quant_config, at::cuda::getCurrentCUDAStream());

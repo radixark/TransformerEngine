@@ -66,7 +66,8 @@ std::vector<py::object> bgrad_quantize(const at::Tensor &grad_output, py::handle
       // Fused kernel for dbias + FP8 cast + FP8 transpose
       with_fused_kernel = true;
     }
-  } else if (detail::IsMXFP8Quantizers(quantizer.ptr())) {
+  } else if (detail::IsMXFP8Quantizers(quantizer.ptr()) &&
+             !detail::IsMXFP8StochasticRoundingQuantizer(quantizer.ptr())) {
     // Fused kernel for dbias + MXFP8 quantize
     with_fused_kernel = true;
   }
@@ -145,7 +146,8 @@ std::vector<py::object> dact_dbias(
   };
   Impl impl = Impl::UNFUSED;
   if (detail::IsFloat8Quantizers(quantizer_py.ptr()) ||
-      detail::IsMXFP8Quantizers(quantizer_py.ptr())) {
+      (detail::IsMXFP8Quantizers(quantizer_py.ptr()) &&
+       !detail::IsMXFP8StochasticRoundingQuantizer(quantizer_py.ptr()))) {
     impl = Impl::FUSED_DACT_DBIAS_QUANTIZE;
   } else if (detail::IsFloat8CurrentScalingQuantizers(quantizer_py.ptr())) {
     impl = Impl::FUSED_DACT_AMAX_FP8;

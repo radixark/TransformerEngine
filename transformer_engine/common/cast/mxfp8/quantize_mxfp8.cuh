@@ -17,6 +17,7 @@
 #include <transformer_engine/transformer_engine.h>
 
 #include "../../common.h"
+#include "../../util/curanddx.hpp"
 #include "../../util/math.h"
 #include "../../util/ptx.cuh"
 #include "../../utils.cuh"
@@ -45,7 +46,7 @@ constexpr size_t THREADS_PER_BANK = TOTAL_BANKS_WIDTH / SCALE_DIM_X;  // 4 = 128
 template <bool IS_DBIAS, bool IS_DACT, bool IS_ACT, typename ParamOP,
           float (*OP)(float, const ParamOP &), typename IType, typename OType, bool ROWWISE_SCALING,
           bool COLWISE_SCALING, bool WITH_GEMM_SWIZZLED_SCALES, size_t CHUNK_DIM_Y,
-          size_t CHUNK_DIM_X, size_t THREADS_PER_CHUNK>
+          size_t CHUNK_DIM_X, size_t THREADS_PER_CHUNK, bool USE_STOCHASTIC_ROUNDING>
 __global__ void __launch_bounds__(THREADS_PER_CHUNK)
     quantize_mxfp8_kernel(const __grid_constant__ CUtensorMap tensor_map_input,
                           const __grid_constant__ CUtensorMap tensor_map_act_input,
@@ -54,7 +55,7 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
                           e8m0_t *const scales_rowwise, e8m0_t *const scales_colwise,
                           const float *noop, float *const dbias_workspace, float *const amax_ptr,
                           const size_t rows, const size_t cols, const size_t scale_stride_rowwise,
-                          const size_t scale_stride_colwise) {
+                          const size_t scale_stride_colwise, const size_t *rng_state) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr bool COMPUTE_ACTIVATIONS = IS_DACT || IS_ACT;
   constexpr bool NO_ACTIVATIONS = !COMPUTE_ACTIVATIONS;
@@ -158,6 +159,23 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
   }
 
   float block_amax = 0.0f;
+
+  // One 32-bit draw rounds four elements; each thread owns one Philox subsequence.
+  transformer_engine::curanddx::detail::philox4x32_native_state<NVTE_BUILD_NUM_PHILOX_ROUNDS> rng;
+  uint4 random_uint4{0, 0, 0, 0};
+  int rnd_idx = 4;
+  if constexpr (USE_STOCHASTIC_ROUNDING) {
+    const size_t rng_sequence =
+        threadIdx.x + (blockIdx.x + blockIdx.y * gridDim.x) * THREADS_PER_CHUNK;
+    rng.init(rng_state[0], rng_sequence, rng_state[1]);
+  }
+  [[maybe_unused]] auto next_rbits = [&]() -> uint32_t {
+    if (rnd_idx == 4) {
+      rnd_idx = 0;
+      random_uint4 = rng.generate4();
+    }
+    return reinterpret_cast<const uint32_t *>(&random_uint4)[rnd_idx++];
+  };
 
 // Initialize shared memory barrier with the number of threads participating in the barrier.
 #pragma nv_diag_suppress static_var_with_dynamic_init
@@ -282,6 +300,7 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
       const ptx::floatx2 block_scale_inverse_2x = {block_scale_inverse, block_scale_inverse};
 
 // 3. Scale elements
+      [[maybe_unused]] float scaled_4x[4];
 #pragma unroll
       for (int i = 0; i < SCALE_DIM_Y; ++i) {
         float in;
@@ -293,7 +312,20 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
         const float scaled_out = in * block_scale_inverse;
 
         const size_t shmem_offset_elt = shmem_offset_base_colwise + i * BUFF_DIM_X;
-        out_colwise_data_sh[shmem_offset_elt] = static_cast<OType>(scaled_out);
+        if constexpr (USE_STOCHASTIC_ROUNDING) {
+          scaled_4x[i % 4] = scaled_out;
+          if (i % 4 == 3) {
+            const uint32_t out_4x = ptx::cvt_fp32_to_fp8_4x_with_stochastic_rounding<OType>(
+                scaled_4x[0], scaled_4x[1], scaled_4x[2], scaled_4x[3], next_rbits());
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+              out_colwise_data_sh[shmem_offset_elt - (3 - j) * BUFF_DIM_X] =
+                  reinterpret_cast<const OType *>(&out_4x)[j];
+            }
+          }
+        } else {
+          out_colwise_data_sh[shmem_offset_elt] = static_cast<OType>(scaled_out);
+        }
       }
     }
 
@@ -437,6 +469,7 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
 #pragma unroll
       for (int w = 0; w < WAVES; ++w) {
         Vec<OType2, PACK_SIZE / 2> out;
+        [[maybe_unused]] float scaled_4x[PACK_SIZE];
 #pragma unroll
         for (int e = 0; e < PACK_SIZE / 2; ++e) {
           IType2 in;
@@ -451,7 +484,18 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
             in.x = in_compute_rowwise[j];
             in.y = in_compute_rowwise[j + 1];
           }
-          ptx::mul_cvt_2x(out_pair, in, block_scale_inverse_2x);
+          if constexpr (USE_STOCHASTIC_ROUNDING) {
+            scaled_4x[2 * e] = static_cast<float>(in.x) * block_scale_inverse;
+            scaled_4x[2 * e + 1] = static_cast<float>(in.y) * block_scale_inverse;
+          } else {
+            ptx::mul_cvt_2x(out_pair, in, block_scale_inverse_2x);
+          }
+        }
+        if constexpr (USE_STOCHASTIC_ROUNDING) {
+          static_assert(PACK_SIZE == 4, "One stochastic-rounding cvt packs four FP8 values.");
+          reinterpret_cast<uint32_t &>(out.data.elt[0]) =
+              ptx::cvt_fp32_to_fp8_4x_with_stochastic_rounding<OType>(
+                  scaled_4x[0], scaled_4x[1], scaled_4x[2], scaled_4x[3], next_rbits());
         }
         const size_t swizzled_group_idx = ((w + bank_group) * PACK_SIZE) % SCALE_DIM_X;
         const size_t swizzled_idx = swizzled_group_idx + thread_offset_X_rowwise;
@@ -558,9 +602,23 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
 template <bool IS_DBIAS, bool IS_DACT, bool IS_ACT, typename ParamOP,
           float (*OP)(float, const ParamOP &)>
 void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop,  // TODO (ksivamani)
-              Tensor *output, Tensor *dbias, Tensor *workspace, cudaStream_t stream) {
+              Tensor *output, Tensor *dbias, Tensor *workspace,
+              const QuantizationConfig &quant_config, cudaStream_t stream) {
   using namespace quantize_kernel;
   checkCuDriverContext(stream);
+
+  const bool use_stochastic_rounding = quant_config.stochastic_rounding;
+  const size_t *rng_state = nullptr;
+  if (use_stochastic_rounding) {
+    NVTE_CHECK(quant_config.rng_state != nullptr,
+               "MXFP8 stochastic rounding requires an RNG state.");
+    const Tensor &rng_state_tensor = *convertNVTETensorCheck(quant_config.rng_state);
+    NVTE_CHECK(rng_state_tensor.dtype() == DType::kInt64,
+               "RNG state should contain 2 64-bit values.");
+    NVTE_CHECK(rng_state_tensor.data.shape == Shape{2},
+               "Shape of the RNG state should be [2], but got ", rng_state_tensor.data.shape);
+    rng_state = reinterpret_cast<const size_t *>(rng_state_tensor.data.dptr);
+  }
 
   bool use_rowwise_scaling = output->has_data();
   bool use_colwise_scaling = output->has_columnwise_data();
@@ -662,8 +720,10 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
                   (scaling_type == ScalingType::BIDIMENSIONAL &&
                    bidimensional_specialized_grid_fits);
 
+              // The specialized kernel rounds to nearest only.
               if (specialized::hasSpec<IS_DBIAS, IS_DACT, IS_ACT, IType, OType>() &&
-                  !WITH_GEMM_SWIZZLED_SCALES && scaling_type_has_specialized_support) {
+                  !WITH_GEMM_SWIZZLED_SCALES && scaling_type_has_specialized_support &&
+                  !use_stochastic_rounding) {
                 switch (scaling_type) {
                   case ScalingType::ROWWISE: {
                     using traits = specialized::CastTraits<IType, OType, true, false>;
@@ -792,50 +852,59 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
                 }
               }
 
-              switch (scaling_type) {
-                case ScalingType::ROWWISE: {
-                  auto kernel = quantize_mxfp8_kernel<IS_DBIAS, IS_DACT, IS_ACT, ParamOP, OP, IType,
-                                                      OType, true, false, WITH_GEMM_SWIZZLED_SCALES,
-                                                      CHUNK_DIM_Y, CHUNK_DIM_X, THREADS_PER_CHUNK>;
-                  NVTE_CHECK_CUDA(cudaFuncSetAttribute(
-                      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dshmem_size));
+              TRANSFORMER_ENGINE_SWITCH_CONDITION(
+                  use_stochastic_rounding, USE_STOCHASTIC_ROUNDING,
+                  switch (scaling_type) {
+                    case ScalingType::ROWWISE: {
+                      auto kernel =
+                          quantize_mxfp8_kernel<IS_DBIAS, IS_DACT, IS_ACT, ParamOP, OP, IType,
+                                                OType, true, false, WITH_GEMM_SWIZZLED_SCALES,
+                                                CHUNK_DIM_Y, CHUNK_DIM_X, THREADS_PER_CHUNK,
+                                                USE_STOCHASTIC_ROUNDING>;
+                      NVTE_CHECK_CUDA(cudaFuncSetAttribute(
+                          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dshmem_size));
 
-                  kernel<<<grid, block_size, dshmem_size, stream>>>(
-                      tensor_map_input, tensor_map_act_input, tensor_map_output_rowwise,
-                      tensor_map_output_colwise, scales_rowwise_ptr, scales_colwise_ptr, noop_ptr,
-                      workspace_ptr, amax_ptr, rows, cols, scale_stride_rowwise,
-                      scale_stride_colwise);
-                  break;
-                }
-                case ScalingType::COLWISE: {
-                  auto kernel = quantize_mxfp8_kernel<IS_DBIAS, IS_DACT, IS_ACT, ParamOP, OP, IType,
-                                                      OType, false, true, WITH_GEMM_SWIZZLED_SCALES,
-                                                      CHUNK_DIM_Y, CHUNK_DIM_X, THREADS_PER_CHUNK>;
-                  NVTE_CHECK_CUDA(cudaFuncSetAttribute(
-                      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dshmem_size));
+                      kernel<<<grid, block_size, dshmem_size, stream>>>(
+                          tensor_map_input, tensor_map_act_input, tensor_map_output_rowwise,
+                          tensor_map_output_colwise, scales_rowwise_ptr, scales_colwise_ptr,
+                          noop_ptr, workspace_ptr, amax_ptr, rows, cols, scale_stride_rowwise,
+                          scale_stride_colwise, rng_state);
+                      break;
+                    }
+                    case ScalingType::COLWISE: {
+                      auto kernel =
+                          quantize_mxfp8_kernel<IS_DBIAS, IS_DACT, IS_ACT, ParamOP, OP, IType,
+                                                OType, false, true, WITH_GEMM_SWIZZLED_SCALES,
+                                                CHUNK_DIM_Y, CHUNK_DIM_X, THREADS_PER_CHUNK,
+                                                USE_STOCHASTIC_ROUNDING>;
+                      NVTE_CHECK_CUDA(cudaFuncSetAttribute(
+                          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dshmem_size));
 
-                  kernel<<<grid, block_size, dshmem_size, stream>>>(
-                      tensor_map_input, tensor_map_act_input, tensor_map_output_rowwise,
-                      tensor_map_output_colwise, scales_rowwise_ptr, scales_colwise_ptr, noop_ptr,
-                      workspace_ptr, amax_ptr, rows, cols, scale_stride_rowwise,
-                      scale_stride_colwise);
-                  break;
-                }
-                case ScalingType::BIDIMENSIONAL: {
-                  auto kernel = quantize_mxfp8_kernel<IS_DBIAS, IS_DACT, IS_ACT, ParamOP, OP, IType,
-                                                      OType, true, true, WITH_GEMM_SWIZZLED_SCALES,
-                                                      CHUNK_DIM_Y, CHUNK_DIM_X, THREADS_PER_CHUNK>;
-                  NVTE_CHECK_CUDA(cudaFuncSetAttribute(
-                      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dshmem_size));
+                      kernel<<<grid, block_size, dshmem_size, stream>>>(
+                          tensor_map_input, tensor_map_act_input, tensor_map_output_rowwise,
+                          tensor_map_output_colwise, scales_rowwise_ptr, scales_colwise_ptr,
+                          noop_ptr, workspace_ptr, amax_ptr, rows, cols, scale_stride_rowwise,
+                          scale_stride_colwise, rng_state);
+                      break;
+                    }
+                    case ScalingType::BIDIMENSIONAL: {
+                      auto kernel =
+                          quantize_mxfp8_kernel<IS_DBIAS, IS_DACT, IS_ACT, ParamOP, OP, IType,
+                                                OType, true, true, WITH_GEMM_SWIZZLED_SCALES,
+                                                CHUNK_DIM_Y, CHUNK_DIM_X, THREADS_PER_CHUNK,
+                                                USE_STOCHASTIC_ROUNDING>;
+                      NVTE_CHECK_CUDA(cudaFuncSetAttribute(
+                          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dshmem_size));
 
-                  kernel<<<grid, block_size, dshmem_size, stream>>>(
-                      tensor_map_input, tensor_map_act_input, tensor_map_output_rowwise,
-                      tensor_map_output_colwise, scales_rowwise_ptr, scales_colwise_ptr, noop_ptr,
-                      workspace_ptr, amax_ptr, rows, cols, scale_stride_rowwise,
-                      scale_stride_colwise);
-                  break;
-                }
-              } NVTE_CHECK_CUDA(cudaGetLastError());
+                      kernel<<<grid, block_size, dshmem_size, stream>>>(
+                          tensor_map_input, tensor_map_act_input, tensor_map_output_rowwise,
+                          tensor_map_output_colwise, scales_rowwise_ptr, scales_colwise_ptr,
+                          noop_ptr, workspace_ptr, amax_ptr, rows, cols, scale_stride_rowwise,
+                          scale_stride_colwise, rng_state);
+                      break;
+                    }
+                  });  // NOLINT(*)
+              NVTE_CHECK_CUDA(cudaGetLastError());
 
               if constexpr (IS_DBIAS) {
                 common::reduce_dbias<IType>(workspace_ptr, dbias, dbias_rows, dbias_cols, stream);

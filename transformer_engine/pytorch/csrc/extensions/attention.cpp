@@ -94,6 +94,8 @@ std::tuple<TensorWrapper, py::object, std::optional<at::Tensor>> quantizer_helpe
     }
   } else if (detail::IsMXFP8Quantizers(quantizer.ptr())) {
     // MXFP8
+    NVTE_CHECK(!detail::IsMXFP8StochasticRoundingQuantizer(quantizer.ptr()),
+               "MXFP8 attention does not support stochastic rounding.");
     if (create_hp_tensor) {
       if (data.has_value()) {
         std::tie(te_T, py_T) = NoneQuantizer(py::none()).create_tensor(shape, dtype, data.value());

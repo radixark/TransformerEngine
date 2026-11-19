@@ -245,6 +245,8 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
   };
   GroupedQuantizationMode grouped_quantization_mode =
       GroupedQuantizationMode::INVALID_FOR_GROUPED_QUANTIZE;
+  NVTE_CHECK(!detail::IsMXFP8StochasticRoundingQuantizer(quantizer.ptr()),
+             "Grouped MXFP8 quantization does not support stochastic rounding.");
   if (detail::IsMXFP8Quantizers(quantizer.ptr())) {
     grouped_quantization_mode = GroupedQuantizationMode::MXFP8_GROUPED_QUANTIZE;
   } else if (detail::IsNVFP4Quantizers(quantizer.ptr())) {
@@ -375,6 +377,8 @@ py::object bgrad_group_quantize(const at::Tensor &tensor, py::handle quantizer,
 
   NVTE_CHECK(detail::IsMXFP8Quantizers(quantizer.ptr()),
              "bgrad_group_quantize: only MXFP8 quantizer is supported.");
+  NVTE_CHECK(!detail::IsMXFP8StochasticRoundingQuantizer(quantizer.ptr()),
+             "bgrad_group_quantize does not support stochastic rounding.");
 
   auto quantizer_cpp = convert_quantizer(quantizer);
 

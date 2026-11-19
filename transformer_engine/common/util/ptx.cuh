@@ -582,6 +582,33 @@ __device__ __forceinline__ void mul_cvt_4x(fp4e2m1x4 &out, const Tx2 &in01, cons
   out = fp4e2m1x4(make_float4(x0, x1, x2, x3));
 }
 
+// Stochastically rounds four FP32 values to FP8 (satfinite); x0 lands in the lowest byte.
+template <typename OType>
+__device__ __forceinline__ uint32_t cvt_fp32_to_fp8_4x_with_stochastic_rounding(
+    const float x0, const float x1, const float x2, const float x3, const uint32_t rbits) {
+  static_assert(std::is_same_v<OType, fp8e4m3> || std::is_same_v<OType, fp8e5m2>,
+                "FP8 stochastic rounding supports E4M3 and E5M2 outputs only.");
+  uint32_t out_4x = 0;
+  constexpr bool has_rs = ARCH_HAS_STOCHASTIC_ROUNDING;
+  if constexpr (has_rs) {
+    // cvt packs its first source operand into the most significant byte.
+    if constexpr (std::is_same_v<OType, fp8e4m3>) {
+      asm volatile("cvt.rs.satfinite.e4m3x4.f32 %0, {%1, %2, %3, %4}, %5;"
+                   : "=r"(out_4x)
+                   : "f"(x3), "f"(x2), "f"(x1), "f"(x0), "r"(rbits));
+    } else {
+      asm volatile("cvt.rs.satfinite.e5m2x4.f32 %0, {%1, %2, %3, %4}, %5;"
+                   : "=r"(out_4x)
+                   : "f"(x3), "f"(x2), "f"(x1), "f"(x0), "r"(rbits));
+    }
+  } else {
+    NVTE_DEVICE_ERROR(
+        "FP8 stochastic rounding PTX instructions are architecture-specific. "
+        "Try recompiling with sm_XXXa instead of sm_XXX.");
+  }
+  return out_4x;
+}
+
 __device__ __forceinline__ fp4e2m1x4 mul_cvt_bf16_to_fp4_4x_with_stochastic_rounding(
     const uint64_t in_4x, const float2 scale, const uint32_t rbits) {
   uint16_t out_4x = 0;
